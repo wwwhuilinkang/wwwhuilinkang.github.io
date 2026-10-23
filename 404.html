@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<!-- 此页面内容为空，作为壳页面放置在github.io上, 
+  iframe方式加载直播前置页面room.php,
+  主要作用是处理用户微信登录跳转和微信支付跳转（负责登录和支付的页面是另外一个域名的页面，与直播页面域名不同）,
+  此方案是为了保护直播页面域名不会因为被微信封禁而不可访问 -->
+ <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0,maximum-scale=1.0, user-scalable=no">
+    <title>直播</title>
+    <meta id="pageDescription" name="description" content="点击进入直播间">
+    <!-- 微信分享标题 -->
+    <meta id="shareTitle" property="og:title" content="直播">
+    <!-- 微信分享描述 -->
+    <meta id="shareDescription" property="og:description" content="点击进入直播间">
+    <meta property="og:type" content="website">
+    <!-- 微信分享图片 -->
+    <meta id="shareImage" property="og:image" content="/share-logo.png?v=20260815">
+    <meta property="og:image:secure_url" content="/share-logo.png?v=20260815">
+    <meta property="og:image:width" content="300">
+    <meta property="og:image:height" content="300">
+    <link id="shareImageLink" rel="image_src" href="/share-logo.png?v=20260815">
+    <!-- 兼容其他分享抓取方式 -->
+    <meta id="itemTitle" itemprop="name" content="直播">
+    <meta id="itemDescription" itemprop="description" content="点击进入直播间">
+    <meta id="itemImage" itemprop="image" content="/share-logo.png?v=20260815">
+    <!-- 固定字体：禁止 iOS 微信跟随系统字体大小缩放页面（保证下方缩放比实测准确） -->
+    <script>
+        (function () {
+            function handleFontSize() {
+                WeixinJSBridge.invoke('setFontSizeCallback', { 'fontSize': 0 });
+                WeixinJSBridge.on('menu:setfont', function () {
+                    WeixinJSBridge.invoke('setFontSizeCallback', { 'fontSize': 0 });
+                });
+            }
+            if (typeof WeixinJSBridge == "object" && typeof WeixinJSBridge.invoke == "function") {
+                handleFontSize();
+            } else {
+                if (document.addEventListener) {
+                    document.addEventListener("WeixinJSBridgeReady", handleFontSize, false);
+                } else if (document.attachEvent) {
+                    document.attachEvent("WeixinJSBridgeReady", handleFontSize);
+                    document.attachEvent("onWeixinJSBridgeReady", handleFontSize);
+                }
+            }
+        })();
+    </script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+        }
+
+        /*
+         * 实际存在于页面中的分享图片。
+         * 图片位于 iframe 后面，用户看不到，但微信可以读取。
+         */
+        #shareCover {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 300px;
+            height: 300px;
+            object-fit: cover;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        #liveFrame {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+            display: block;
+            background: #000;
+            z-index: 1;
+        }
+
+        /* 内页加载失败时的可见提示层 */
+        #loadError {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 3;
+            background: rgba(0, 0, 0, 0.88);
+            color: #fff;
+            font-size: 16px;
+            text-align: center;
+            display: none;
+        }
+
+        #loadError .load-error-box {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            padding: 24px 32px;
+            background: #1f1f1f;
+            border-radius: 10px;
+            line-height: 1.6;
+            white-space: nowrap;
+        }
+
+        #loadError .load-error-tip {
+            font-size: 13px;
+            color: #bbb;
+            margin-top: 10px;
+        }
+
+        #errorMessage {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            padding: 30px 15px;
+            color: #333;
+            background: #fff;
+            font-size: 16px;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- 不要删除，这是给微信读取的实际图片 -->
+    <img id="shareCover" src="/share-logo.png?v=20260815" width="300" height="300"
+        alt="直播">
+    <iframe id="liveFrame" allow="autoplay; fullscreen" allowfullscreen></iframe>
+    <!-- 内页加载失败提示（默认隐藏） -->
+    <div id="loadError">
+        <div class="load-error-box">
+            直播间加载失败
+            <div class="load-error-tip">请检查网络后重新进入</div>
+        </div>
+    </div>
+    <script>
+        (function () {
+            var LIVE_ORIGIN = 'https://app.huilinkangxuan.space';
+
+            /* iframe 是否真正加载成功（由内页发出的 live-ready 消息确认） */
+            var liveReady = false;
+
+            /* 加载超时定时器 */
+            var loadTimer = null;
+
+            var oauthCode = '';
+
+            var oauthState = '';
+
+            var payResult = '';
+
+            var payKey = '';
+
+            var DEFAULT_TITLE = '直播';
+            var DEFAULT_DESCRIPTION = '点击进入直播间';
+
+            /*
+             * 分享图片固定使用 GitHub 上的图片，
+             * 不再使用 fxfx.stmpsk.cn 的 HTTP 图片。
+             */
+            var DEFAULT_IMAGE = '/share-logo.png?v=20260815';
+
+            var liveFrame = document.getElementById('liveFrame');
+
+            /*
+             * 系统大字体(textZoom)适配：
+             * 壳页面与 iframe 处于同一 WebView，缩放比一致，
+             * 直接在本页实测后先放大 iframe 再整体缩回，均匀抵消文字缩放。
+             * iOS 已由上方 WeixinJSBridge 锁定字体，此处测得为 1，不会触发。
+             */
+            (function fixFontScale() {
+                try {
+                    var span = document.createElement('span');
+                    span.style.cssText = 'font-size:16px;position:absolute;left:-9999px;top:-9999px;';
+                    span.textContent = '测试';
+                    document.body.appendChild(span);
+                    var fs = parseFloat(window.getComputedStyle(span).fontSize);
+                    document.body.removeChild(span);
+                    var scale = fs / 16;
+                    if (scale > 0 && Math.abs(scale - 1) > 0.02) {
+                        liveFrame.style.width = (scale * 100) + '%';
+                        liveFrame.style.height = (scale * 100) + '%';
+                        liveFrame.style.transform = 'scale(' + (1 / scale) + ')';
+                        liveFrame.style.transformOrigin = '0 0';
+                    }
+                } catch (e) {}
+            })();
+
+            /*
+             * 更新页面标题和分享资料
+             */
+            function updateShareInfo(title, description) {
+                title = title || DEFAULT_TITLE;
+
+                description =
+                    description || DEFAULT_DESCRIPTION;
+
+                /*
+                 * 图片固定，不接受 iframe 传来的图片地址，
+                 * 防止再次被 HTTP 图片覆盖。
+                 */
+                var image = DEFAULT_IMAGE;
+
+                document.title = title;
+
+                setMetaContent('shareTitle', title);
+
+                setMetaContent(
+                    'shareDescription',
+                    description);
+
+                setMetaContent(
+                    'shareImage',
+                    image);
+
+                setMetaContent(
+                    'itemTitle',
+                    title);
+
+                setMetaContent(
+                    'itemDescription',
+                    description);
+
+                setMetaContent(
+                    'itemImage',
+                    image);
+
+                setMetaContent(
+                    'pageDescription',
+                    description);
+
+                var imageLink =
+                    document.getElementById(
+                        'shareImageLink');
+
+                if (imageLink) {
+                    imageLink.setAttribute(
+                        'href',
+                        image);
+                }
+
+                var shareCover =
+                    document.getElementById(
+                        'shareCover');
+
+                if (shareCover) {
+                    shareCover.src = image;
+                    shareCover.alt = title;
+                }
+
+                console.log(
+                    '分享资料已更新：', {
+                    title: title,
+                    description: description,
+                    image: image
+                });
+            }
+
+            function setMetaContent(id, value) {
+                var element =
+                    document.getElementById(id);
+
+                if (element) {
+                    element.setAttribute(
+                        'content',
+                        value);
+                }
+            }
+
+            /*
+             * 从中转页带回的地址中提取 code 和 state，
+             * 以及支付页带回的支付结果，
+             * 并立即清理地址栏，避免刷新时重复使用。
+             */
+            function extractOAuthFromUrl() {
+                var params =
+                    new URLSearchParams(
+                        window.location.search);
+
+                oauthCode =
+                    params.get('code') || '';
+
+                oauthState =
+                    params.get('state') || '';
+
+                payResult =
+                    params.get('pay_result') || '';
+
+                payKey =
+                    params.get('pay_key') || '';
+
+                if (oauthCode && oauthState) {
+                    params.delete('code');
+                    params.delete('state');
+                }
+
+                if (payResult && payKey) {
+                    params.delete('pay_result');
+                    params.delete('pay_key');
+                }
+
+                if (oauthCode || payResult) {
+                    var cleanUrl =
+                        window.location.pathname;
+
+                    var remainingQuery =
+                        params.toString();
+
+                    if (remainingQuery) {
+                        cleanUrl +=
+                            '?' + remainingQuery;
+                    }
+
+                    cleanUrl +=
+                        window.location.hash;
+
+                    window.history.replaceState(
+                        null,
+                        '',
+                        cleanUrl);
+                }
+            }
+
+            /*
+             * 接收直播页面发送的消息
+             */
+            window.addEventListener(
+                'message', function (event) {
+                    if (
+                        event.origin !== LIVE_ORIGIN) {
+                        return;
+                    }
+
+                    var data = event.data || {};
+
+                    /*
+                     * 内页已开始执行，标记加载成功并取消超时提示
+                     */
+                    if (data.type === 'live-ready') {
+                        liveReady = true;
+
+                        if (loadTimer) {
+                            clearTimeout(loadTimer);
+                            loadTimer = null;
+                        }
+
+                        return;
+                    }
+
+                    /*
+                     * 接收直播名称和描述
+                     */
+                    if (
+                        data.type ===
+                        'live-share-info') {
+                        updateShareInfo(
+                            data.title,
+                            data.description);
+
+                        return;
+                    }
+
+                    /*
+                     * iframe 请求微信登录，
+                     * 由 GitHub 外层页面顶层跳转。
+                     */
+                    if (
+                        data.type ===
+                        'wechat-login' &&
+                        data.url) {
+                        var loginUrl =
+                            String(data.url);
+
+                        /*
+                         * 只允许打开微信官方授权地址
+                         */
+                        if (
+                            loginUrl.indexOf('https://open.weixin.qq.com/') === 0) {
+                            window.location.href = loginUrl;
+                        }
+
+                        return;
+                    }
+
+                    /*
+                     * iframe 请求顶层打开页面。
+                     * 购买和支付页面可以使用此消息。
+                     */
+                    if (
+                        data.type ===
+                        'top-redirect' &&
+                        data.url) {
+                        var redirectUrl =
+                            String(data.url);
+
+                        if (
+                            redirectUrl.indexOf(
+                                'https://') === 0) {
+                            window.location.href =
+                                redirectUrl;
+                        }
+                    }
+                });
+
+            /*
+             * 提取中转页带回的 code 和 state
+             */
+            extractOAuthFromUrl();
+
+            /*
+             * 解析地址：
+             * /web/live/30/1
+             */
+            var parts =
+                window.location.pathname
+                    .split('/')
+                    .filter(function (item) {
+                        return item !== '';
+                    });
+
+            var liveIndex =
+                parts.indexOf('live');
+
+            if (
+                liveIndex === -1 || !parts[liveIndex + 1] || !parts[liveIndex + 2]) {
+                document.body.innerHTML =
+                    '<div id="errorMessage">' +
+                    '参数错误' +
+                    '</div>';
+
+                return;
+            }
+
+            var id =
+                parts[liveIndex + 1];
+
+            var spid =
+                parts[liveIndex + 2];
+
+            var targetUrl =
+                LIVE_ORIGIN +
+                '/live/room.php?id=' +
+                encodeURIComponent(id) +
+                '&spid=' +
+                encodeURIComponent(spid) +
+                '&sh=' +
+                encodeURIComponent(
+                    window.location.origin +
+                    window.location.pathname);
+
+            if (oauthCode && oauthState) {
+                targetUrl +=
+                    '&oauth_code=' +
+                    encodeURIComponent(oauthCode);
+
+                targetUrl +=
+                    '&oauth_state=' +
+                    encodeURIComponent(oauthState);
+            }
+
+            // 调试参数透传：?debugwx=1 时让 iframe 绕过微信 UA 判断（仅开发用）
+            if (new URLSearchParams(
+                window.location.search).get('debugwx') === '1') {
+                targetUrl += '&debugwx=1';
+            }
+
+            // 临时诊断参数透传：?diag=1 时让内页显示屏幕/字体缩放参数
+            if (new URLSearchParams(
+                window.location.search).get('diag') === '1') {
+                targetUrl += '&diag=1';
+            }
+
+            // 支付返回：通知 room.php 直接播放直播画面，不再显示“点击观看”按钮
+            if (payResult) {
+                targetUrl += '&autoplay=1';
+            }
+
+            /*
+             * iframe 加载完成以后：
+             * 1. 索取直播标题
+             * 2. 如有支付结果则转发给 iframe
+             */
+            liveFrame.addEventListener(
+                'load', function () {
+                    liveFrame.contentWindow.postMessage({
+                        type: 'request-live-share-info'
+                    },
+                        LIVE_ORIGIN);
+
+                    if (payResult && payKey) {
+                        liveFrame.contentWindow.postMessage({
+                            type: 'pay-result',
+                            result: payResult,
+                            payKey: payKey
+                        },
+                            LIVE_ORIGIN);
+                    }
+                });
+
+            /*
+             * 最后设置 iframe 地址
+             */
+            liveFrame.src = targetUrl;
+        })();
+    </script>
+</body>
+
+</html>
